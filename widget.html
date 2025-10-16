@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Insights.ai Widget (v7)</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    body{margin:0;background:#0b0b0b;color:#eaeaea;font-family:Inter,system-ui,sans-serif}
+    .wrap{padding:12px; width:100%; max-width:320px}
+    .panel{background:#101010;border:1px solid #1f1f1f;border-radius:12px;padding:12px}
+    .row{display:flex;justify-content:space-between;align-items:center}
+    h2{font-size:14px;margin:0 0 8px;color:#fff}
+    .score{font-size:22px;font-weight:700;color:#fff}
+    .chip{font-size:11px;color:#cfcfcf;border:1px solid #2a2a2a;border-radius:999px;padding:4px 8px}
+    .meta{font-size:12px;color:#bdbdbd;margin:8px 0}
+    .small{font-size:12px;color:#bdbdbd}
+    .btn{display:inline-block;background:#e5e5e5;color:#000;border:1px solid #d1d1d1;border-radius:8px;padding:8px 10px;text-decoration:none;font-size:12px;cursor:pointer}
+    .btn.secondary{background:transparent;color:#e5e5e5;border:1px solid #3a3a3a}
+    .draft{display:none;margin-top:8px}
+    textarea{width:100%;min-height:130px;background:#0b0b0b;color:#fff;border:1px solid #2a2a2a;border-radius:8px;padding:8px}
+    canvas{width:100%;height:32px;margin:6px 0 2px}
+    .divider{border-top:1px solid #1f1f1f;margin:10px 0}
+    select{background:#0b0b0b;color:#eaeaea;border:1px solid #3a3a3a;border-radius:8px;padding:6px 8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      {% if not data %}
+        <h2>Insights.ai</h2>
+        <div class="small">No recent analysis found for this contact yet.</div>
+      {% else %}
+        <div class="row">
+          <div><h2>Insights.ai Score</h2><div class="score">{{ data.insights_score or '—' }}/100</div></div>
+          <div class="chip">{{ data.tone or '—' }}</div>
+        </div>
+        <canvas id="spark"></canvas>
+        <div class="meta"><strong>Next:</strong> {{ data.next_action or '—' }}</div>
+        <div class="small">Stage: {{ data.stage }} • Revaluate: {{ data.reval if data.reval else '—' }}</div>
+        <div class="divider"></div>
+        <div class="row" style="gap:8px;align-items:center">
+          <div class="small">Tone</div>
+          <select id="toneSel">
+            {% for t in ['Recommended','Professional','Friendly','Analytical','Empathetic','Persuasive','Luxury Buyer','High-Energy'] %}
+              <option {% if data.tone_mode==t %}selected{% endif %}>{{ t }}</option>
+            {% endfor %}
+          </select>
+          <a class="btn secondary" href="#" onclick="regen();return false;">Regenerate</a>
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <label class="small"><input type="checkbox" id="marketToggle" checked> Market Data</label>
+          <label class="small"><input type="checkbox" id="newsToggle" checked> News Headlines</label>
+        </div>
+        <a class="btn secondary" style="margin-top:8px" href="#" onclick="toggleDraft();return false;">Show Draft Message</a>
+        <div id="draftBox" class="draft">
+          <textarea id="draft">{{ data.draft or '' }}</textarea>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <a class="btn" href="#" onclick="copyDraft();return false;">Copy Message</a>
+            <a class="btn secondary" href="#" onclick="refine();return false;">Refine Draft</a>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <div class="small">Last analyzed: {{ data.created_at }}</div>
+      {% endif %}
+      <div class="divider"></div>
+      <div class="small"><strong>NYC News & Reports</strong></div>
+      <ul class="small" id="newsList">
+        {% for n in news %}
+          <li><a target="_blank" style="color:#e5e5e5" href="{{ n.link }}">{{ n.title }}</a>{% if n.summary %} — {{ n.summary[:120] }}...{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  <script>
+    function toggleDraft(){const el=document.getElementById('draftBox'); el.style.display=(el.style.display==='block'?'none':'block');}
+    function copyDraft(){const t=document.getElementById('draft'); t.select(); document.execCommand('copy'); alert('Draft copied');}
+    async function regen(){
+      const tone=document.getElementById('toneSel').value;
+      const include_market = document.getElementById('marketToggle').checked ? 1 : 0;
+      const include_news   = document.getElementById('newsToggle').checked   ? 1 : 0;
+      const qs=new URLSearchParams({contact_id: {{ data.contact_id if data else 0 }}, tone, include_news, include_market});
+      const res=await fetch('/api/regen_draft',{method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:qs});
+      const j=await res.json(); document.getElementById('draft').value=j.draft||'';
+    }
+    async function refine(){
+      const tone=document.getElementById('toneSel').value;
+      const draft=document.getElementById('draft').value;
+      const qs=new URLSearchParams({contact_id: {{ data.contact_id if data else 0 }}, tone, current_draft: draft});
+      const res=await fetch('/api/refine_draft',{method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:qs});
+      const j=await res.json(); document.getElementById('draft').value=j.draft||draft; alert('✨ Draft refined');
+    }
+    const spark = {{ spark|tojson }};
+    if(spark && spark.length>0){
+      const ctx = document.getElementById('spark').getContext('2d');
+      const points = spark.map(s => s[0] || 0).reverse();
+      ctx.strokeStyle = '#cfcfcf'; ctx.lineWidth = 1.5; ctx.beginPath();
+      const W = ctx.canvas.width, H = ctx.canvas.height;
+      const max = Math.max(...points), min = Math.min(...points);
+      const span = Math.max(1, max - min);
+      points.forEach((v, i) => { const x=(i/(points.length-1||1))*W; const y=H-((v-min)/span)*H; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+      ctx.stroke();
+    }
+  </script>
+</body>
+</html>
