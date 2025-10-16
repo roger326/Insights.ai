@@ -170,12 +170,65 @@ def export_csv():
 # Widget (for FUB) + Sandbox
 # -----------------------------------------------------------------------------
 @app.get("/widget")
-def widget(request: Request, contact_id: int, include_market: int = 1, include_news: int = 1):
+def widget(
+    request: Request,
+    contact_id: int,
+    include_market: int = 1,
+    include_news: int = 1,
+    auto: int = 0,   # NEW: toggle auto-analysis on first load
+):
+    from market_news import fetch_news, fetch_market_snapshot
+
+    # 1) Check last analysis for this contact
     last = fetch_last_analysis(contact_id)
+
+    # 2) If none and auto=1, run a first-pass analysis now
+    if not last and auto:
+        person = fub_get(f"/people/{contact_id}")
+        person = person.get("person", person) if isinstance(person, dict) else person
+        notes = get_notes(contact_id)
+        emails = get_emails(contact_id)
+        lead = score_lead(person, notes, emails)
+        borough_hint = detect_borough(person)
+
+        news_items = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
+        market = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
+
+        tone_txt, action, draft, _raw = gpt_analyze(
+            person, notes, emails, lead,
+            tone_mode="Recommended",
+            market_bullets=market.get("bullets"),
+            news_items=news_items,
+            borough_hint=borough_hint
+        )
+
+        insight = compute_insights_score(person, lead, get_revaluate_score(person), contact_id)
+        update_fub_insights_score(contact_id, insight)
+
+        log_analysis(
+            contact_id,
+            person.get("name"),
+            person.get("stage"),
+            person.get("tags"),
+            lead,
+            "WARM" if lead >= 5 else "COOL",
+            tone_txt,
+            "Recommended",
+            action,
+            draft,
+            insight,
+            get_revaluate_score(person),
+        )
+
+        # refresh "last" after logging
+        last = fetch_last_analysis(contact_id)
+
+    # 3) Render the widget with news/market (as before)
     news = fetch_news(max_items=4, nyc_only=True)
     market = fetch_market_snapshot(area="NYC")
 
     if not last:
+        # still nothing? (e.g., FUB API error) -> show empty state
         return templates.TemplateResponse(
             "widget.html",
             {
@@ -205,6 +258,7 @@ def widget(request: Request, contact_id: int, include_market: int = 1, include_n
         "reval": last[10],
         "created_at": last[11],
     }
+
     return templates.TemplateResponse(
         "widget.html",
         {
@@ -217,6 +271,7 @@ def widget(request: Request, contact_id: int, include_market: int = 1, include_n
             "include_news": include_news,
         },
     )
+
 
 
 @app.get("/sandbox", dependencies=[Depends(require_auth)])
