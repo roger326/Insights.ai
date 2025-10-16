@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>insights.ai – Analytics</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand"><div class="dot"></div><h1>insights.ai</h1></div>
+    <div class="actions">
+      <a class="button" href="/">Daily Focus</a>
+      <a class="button" href="/export-csv">Download CSV</a>
+    </div>
+  </header>
+  <div class="page">
+    <div class="kpis">
+      <div class="kpi"><h3>Analyzed Entries (all)</h3><div class="num">{{ metrics['count'] }}</div></div>
+      <div class="kpi"><h3>Average Insights.ai Score</h3><div class="num">{{ metrics['avg_score'] }}</div></div>
+      <div class="kpi"><h3>Pipeline Mix</h3><div>HOT {{ metrics['cats']['HOT'] }} • WARM {{ metrics['cats']['WARM'] }} • COOL {{ metrics['cats']['COOL'] }} • DORMANT {{ metrics['cats']['DORMANT'] }}</div></div>
+      <div class="kpi"><h3>Tone</h3><div>+ {{ metrics['tones']['Positive'] }}  ·  ~ {{ metrics['tones']['Neutral'] }}  ·  – {{ metrics['tones']['Negative'] }}</div></div>
+    </div>
+    <h2>Lead Score Trend</h2>
+    <canvas id="scoreChart"></canvas>
+    <h2 style="margin-top:24px;">Tone Distribution</h2>
+    <canvas id="toneChart"></canvas>
+  </div>
+  <footer>Powered by insights.ai</footer>
+  <script>
+    const rows = {{ rows|tojson }};
+    const labels = rows.map(r => r[2]).reverse();
+    const scores = rows.map(r => r[6] || 0).reverse();
+    new Chart(document.getElementById('scoreChart'),{
+      type:'line', data:{labels, datasets:[{label:'Insights.ai Score', data:scores}]}, options:{responsive:true, plugins:{legend:{display:false}}}
+    });
+    const toneCounts={Positive:0,Neutral:0,Negative:0};
+    rows.forEach(r=>{ const t=(r[4]||'Neutral').toLowerCase(); if(t.includes('pos')) toneCounts.Positive++; else if(t.includes('neg')) toneCounts.Negative++; else toneCounts.Neutral++; });
+    new Chart(document.getElementById('toneChart'),{ type:'pie', data:{labels:Object.keys(toneCounts), datasets:[{data:Object.values(toneCounts)}]}, options:{responsive:true} });
+  </script>
+</body>
+</html>
