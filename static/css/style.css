@@ -1,3 +1,0 @@
-:root{ --bg:#0f0f10; --text:#e6e6e6; --sub:#a8a8a8; --card:#101012; --line:#1f1f22; }
-body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif}
-a{color:#d3d3d3;text-decoration:none}
