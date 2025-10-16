@@ -8,7 +8,9 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from openai import OpenAI
 
 # Local modules
 from models import (
@@ -25,12 +27,10 @@ from scheduler import (
     update_fub_insights_score,
     score_lead,
     detect_borough,
-    gpt_analyze,
     TONE_PROFILES,
     fub_get,
     get_notes,
     get_emails,
-    get_revaluate_score,
 )
 from market_news import fetch_news, fetch_market_snapshot
 
@@ -38,7 +38,26 @@ from market_news import fetch_news, fetch_market_snapshot
 # App bootstrap
 # -----------------------------------------------------------------------------
 load_dotenv()
-app = FastAPI(title="insights.ai – Command Hub (v7)")
+app = FastAPI(title="insights.ai – Command Hub (v7.1)")
+
+# Allow Follow Up Boss to embed in an iframe
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.followupboss.com", "https://*.followupboss.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def allow_iframe_from_fub(request, call_next):
+    resp = await call_next(request)
+    # Permit embedding by FUB (legacy + CSP)
+    resp.headers["X-Frame-Options"] = "ALLOWALL"
+    resp.headers["Content-Security-Policy"] = (
+        "frame-ancestors 'self' https://app.followupboss.com https://*.followupboss.com;"
+    )
+    return resp
 
 # Ensure 'static' exists (Render/Git sometimes ship empty dirs)
 if not os.path.isdir("static"):
@@ -49,8 +68,13 @@ templates = Jinja2Templates(directory="templates")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "devsecret")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "Bernese2025!")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60 * 60 * 24)
+
+# OpenAI client (new SDK)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -----------------------------------------------------------------------------
 # Auth helper
@@ -72,7 +96,7 @@ def require_auth(request: Request):
     )
 
 # -----------------------------------------------------------------------------
-# FUB contact id resolver (supports merge tag OR context blob)
+# Helpers: resolve FUB contact id, extract Revaluate Score, generate draft
 # -----------------------------------------------------------------------------
 def _resolve_contact_id(request: Request, contact_id):
     """
@@ -99,6 +123,121 @@ def _resolve_contact_id(request: Request, contact_id):
     except Exception:
         return None
     return None
+
+def _extract_revaluate(person: dict) -> float | None:
+    """
+    Robustly extract 'Revaluate Score' regardless of FUB custom field shape.
+    Tries these shapes:
+      1) person['custom'] -> dict with variants of the key
+      2) person['customFields'] -> list of {name,label,value}
+      3) person['properties'] or ['custom']['fields'] (rare legacy)
+    Returns float or None.
+    """
+    if not person:
+        return None
+
+    # 1) 'custom' dict
+    custom = person.get("custom")
+    if isinstance(custom, dict):
+        for k in custom.keys():
+            kl = str(k).strip().lower()
+            if "revaluate" in kl and "score" in kl:
+                try:
+                    return float(custom[k])
+                except Exception:
+                    pass
+        # some accounts nest: {'fields': [{'name': 'Revaluate Score', 'value': '40'}]}
+        fields = custom.get("fields")
+        if isinstance(fields, list):
+            for f in fields:
+                name = str(f.get("name", "")).lower()
+                if "revaluate" in name and "score" in name:
+                    try:
+                        return float(f.get("value"))
+                    except Exception:
+                        pass
+
+    # 2) 'customFields' array
+    cf = person.get("customFields")
+    if isinstance(cf, list):
+        for f in cf:
+            # fields often have one of: name / label / field / fieldName
+            cand = (
+                f.get("name") or f.get("label") or f.get("fieldName") or f.get("field")
+            )
+            val = f.get("value")
+            if cand and isinstance(cand, str):
+                kl = cand.strip().lower()
+                if "revaluate" in kl and "score" in kl:
+                    try:
+                        return float(val)
+                    except Exception:
+                        pass
+
+    # 3) 'properties' map (rare)
+    props = person.get("properties")
+    if isinstance(props, dict):
+        for k in props.keys():
+            kl = str(k).strip().lower()
+            if "revaluate" in kl and "score" in kl:
+                try:
+                    return float(props[k])
+                except Exception:
+                    pass
+
+    return None
+
+def _generate_draft(person, notes, emails, lead, tone_mode, market_bullets=None, news_items=None, borough_hint=None):
+    tone_desc = TONE_PROFILES.get(tone_mode or "Recommended", "")
+    texts = []
+    for n in notes or []:
+        texts.append(n.get("body", ""))
+    for e in emails or []:
+        texts.extend([e.get("body", ""), e.get("subject", "")])
+    combined = "\n".join([t for t in texts if t])[-3000:] or "(No recent text found.)"
+    mb = "\n".join(f"- {b}" for b in (market_bullets or []))
+    ni = "\n".join(
+        f"- {n.get('title')} — {n.get('summary','')[:160]}..." for n in (news_items or [])
+    )
+    b_focus = f"The client’s market context is {borough_hint.title()}." if borough_hint else ""
+
+    prompt = f"""
+You are Roger's "Insights.ai" assistant. Draft a concise (≤ 90 words), human, NYC-savvy outreach.
+
+{b_focus}
+Contact: {person.get('name')}
+Stage: {person.get('stage')}
+Lead score: {lead}
+Tone style: {tone_mode} — {tone_desc}
+
+Recent history:
+{combined}
+
+Current Market Highlights:
+{mb}
+
+Recent Headlines:
+{ni}
+
+Task:
+1) Write one short message that naturally weaves 1–2 contextual insights above.
+2) Keep it confident, helpful, and specific (no clichés).
+3) End with a soft next step.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.55,
+            max_tokens=450,
+        )
+        draft = resp.choices[0].message.content.strip()
+        tone = tone_mode
+        next_action = "Follow up to re-engage."
+        return tone, next_action, draft
+    except Exception as e:
+        return "Neutral", "Follow up manually.", f"[Error: {e}]"
 
 # -----------------------------------------------------------------------------
 # Lifecycle
@@ -232,22 +371,20 @@ def widget(
         emails = get_emails(cid)
         lead = score_lead(person, notes, emails)
         borough_hint = detect_borough(person)
-
         news_items = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
         market_full = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
+        # NEW: robust Revaluate extraction
+        reval = _extract_revaluate(person)
 
-        tone_txt, action, draft, _raw = gpt_analyze(
-            person,
-            notes,
-            emails,
-            lead,
+        tone_txt, action, draft = _generate_draft(
+            person, notes, emails, lead,
             tone_mode="Recommended",
             market_bullets=market_full.get("bullets"),
             news_items=news_items,
             borough_hint=borough_hint,
         )
 
-        insight = compute_insights_score(person, lead, get_revaluate_score(person), cid)
+        insight = compute_insights_score(person, lead, reval, cid)
         update_fub_insights_score(cid, insight)
 
         log_analysis(
@@ -262,7 +399,7 @@ def widget(
             action,
             draft,
             insight,
-            get_revaluate_score(person),
+            reval,
         )
 
         last = fetch_last_analysis(cid)
@@ -282,6 +419,16 @@ def widget(
             },
         )
 
+    # If the stored reval is None, try to fetch a current value live for display
+    display_reval = last[10]
+    if display_reval is None:
+        try:
+            person_now = fub_get(f"/people/{cid}")
+            person_now = person_now.get("person", person_now) if isinstance(person_now, dict) else person_now
+            display_reval = _extract_revaluate(person_now)
+        except Exception:
+            pass
+
     spark = fetch_latest_for_contact(cid, limit=5)
     data = {
         "contact_id": cid,
@@ -295,7 +442,7 @@ def widget(
         "next_action": last[7],
         "draft": last[8],
         "insights_score": last[9],
-        "reval": last[10],
+        "reval": display_reval,
         "created_at": last[11],
     }
 
@@ -344,10 +491,12 @@ async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_ne
     borough_hint = detect_borough(person)
     news = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
     market = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
+    # NEW: robust Revaluate extraction
+    reval = _extract_revaluate(person)
 
-    # Generate draft
+    # Generate draft (new SDK)
     tone_mode = tone if tone in TONE_PROFILES else "Recommended"
-    tone_txt, action, draft, _raw = gpt_analyze(
+    tone_txt, action, draft = _generate_draft(
         person,
         notes,
         emails,
@@ -359,10 +508,10 @@ async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_ne
     )
 
     # Compute and write back Insights.ai Score to FUB custom field
-    insight = compute_insights_score(person, lead, get_revaluate_score(person), contact_id)
+    insight = compute_insights_score(person, lead, reval, contact_id)
     update_fub_insights_score(contact_id, insight)
 
-    # Log locally for analytics
+    # Log locally for analytics (store reval too)
     log_analysis(
         contact_id,
         person.get("name"),
@@ -375,29 +524,27 @@ async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_ne
         action,
         draft,
         insight,
-        get_revaluate_score(person),
+        reval,
     )
 
     return JSONResponse(
-        {"tone": tone_txt, "tone_mode": tone_mode, "next_action": action, "draft": draft, "insights_score": insight}
+        {"tone": tone_txt, "tone_mode": tone_mode, "next_action": action, "draft": draft, "insights_score": insight, "revaluate_score": reval}
     )
 
 @app.post("/api/refine_draft")
 async def api_refine_draft(contact_id: int, current_draft: str, tone: str = "Recommended"):
-    import openai
     tone_mode = tone if tone in TONE_PROFILES else "Recommended"
     prompt = (
         "Refine and slightly tighten the following outreach draft without changing the tone or meaning. "
         f"Keep <= 90 words. Tone style: {TONE_PROFILES.get(tone_mode, '')}\n\n---\n{current_draft}\n---"
     )
     try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4-turbo",
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
-        new_text = resp["choices"][0]["message"]["content"].strip()
+        new_text = resp.choices[0].message.content.strip()
     except Exception:
         new_text = current_draft
     return JSONResponse({"draft": new_text, "tone_mode": tone_mode})
-
