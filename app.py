@@ -1,5 +1,8 @@
 import os
 import io
+import json
+from base64 import urlsafe_b64decode
+
 from fastapi import FastAPI, Request, Depends, Form, Query, HTTPException, status
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -37,7 +40,7 @@ from market_news import fetch_news, fetch_market_snapshot
 load_dotenv()
 app = FastAPI(title="insights.ai – Command Hub (v7)")
 
-# Ensure 'static' exists (Git ignores empty folders in some deploys like Render)
+# Ensure 'static' exists (Render/Git sometimes ship empty dirs)
 if not os.path.isdir("static"):
     os.makedirs("static/css", exist_ok=True)
 
@@ -49,7 +52,9 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "Bernese2025!")
 
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60 * 60 * 24)
 
-
+# -----------------------------------------------------------------------------
+# Auth helper
+# -----------------------------------------------------------------------------
 def require_auth(request: Request):
     """
     Gate dashboard routes behind a simple password check.
@@ -60,12 +65,40 @@ def require_auth(request: Request):
         return
     if request.session.get("authed"):
         return
-    # Redirect via an exception so FastAPI issues a proper 307 with Location
+    # Redirect via exception so FastAPI issues a 307 with Location
     raise HTTPException(
         status_code=status.HTTP_307_TEMPORARY_REDIRECT,
         headers={"Location": "/login"},
     )
 
+# -----------------------------------------------------------------------------
+# FUB contact id resolver (supports merge tag OR context blob)
+# -----------------------------------------------------------------------------
+def _resolve_contact_id(request: Request, contact_id):
+    """
+    Accept an int-like contact_id or extract it from Follow Up Boss 'context' param.
+    """
+    # If integer-like, use it
+    try:
+        if contact_id is not None and str(contact_id).isdigit():
+            return int(contact_id)
+    except Exception:
+        pass
+
+    # Fallback: parse FUB context
+    ctx = request.query_params.get("context")
+    if not ctx:
+        return None
+    try:
+        # Base64-url decode with padding and parse JSON
+        padded = ctx + "=" * (-len(ctx) % 4)
+        data = json.loads(urlsafe_b64decode(padded.encode()).decode())
+        pid = data.get("person", {}).get("id")
+        if pid:
+            return int(pid)
+    except Exception:
+        return None
+    return None
 
 # -----------------------------------------------------------------------------
 # Lifecycle
@@ -75,14 +108,12 @@ def on_startup():
     init_db()
     start_scheduler(app)
 
-
 # -----------------------------------------------------------------------------
 # Auth + Dashboard
 # -----------------------------------------------------------------------------
 @app.get("/login")
 def login_page(request: Request):
     return templates.TemplateResponse("login.html", {"request": request, "error": None})
-
 
 @app.post("/login")
 def login_submit(request: Request, password: str = Form(...)):
@@ -93,12 +124,10 @@ def login_submit(request: Request, password: str = Form(...)):
         "login.html", {"request": request, "error": "Invalid password"}
     )
 
-
 @app.get("/", dependencies=[Depends(require_auth)])
 def index(request: Request):
     entries = fetch_recent(limit=25)
     return templates.TemplateResponse("index.html", {"request": request, "entries": entries})
-
 
 @app.get("/analytics", dependencies=[Depends(require_auth)])
 def analytics(request: Request):
@@ -121,11 +150,9 @@ def analytics(request: Request):
         "analytics.html", {"request": request, "rows": rows, "metrics": metrics}
     )
 
-
 @app.get("/export-csv", dependencies=[Depends(require_auth)])
 def export_csv():
     from models import _conn
-
     conn = _conn()
     c = conn.cursor()
     c.execute(
@@ -140,7 +167,6 @@ def export_csv():
 
     output = io.StringIO()
     import csv as _csv
-
     w = _csv.writer(output)
     w.writerow(
         [
@@ -165,70 +191,24 @@ def export_csv():
         headers={"Content-Disposition": "attachment; filename=insights_ai_all_analyses.csv"},
     )
 
-
 # -----------------------------------------------------------------------------
-# Widget (for FUB) + Sandbox
+# Widget (FUB) + Sandbox
 # -----------------------------------------------------------------------------
 @app.get("/widget")
 def widget(
     request: Request,
-    contact_id: int,
+    contact_id: str | None = None,
     include_market: int = 1,
     include_news: int = 1,
-    auto: int = 0,   # NEW: toggle auto-analysis on first load
+    auto: int = 0,
 ):
-    from market_news import fetch_news, fetch_market_snapshot
-
-    # 1) Check last analysis for this contact
-    last = fetch_last_analysis(contact_id)
-
-    # 2) If none and auto=1, run a first-pass analysis now
-    if not last and auto:
-        person = fub_get(f"/people/{contact_id}")
-        person = person.get("person", person) if isinstance(person, dict) else person
-        notes = get_notes(contact_id)
-        emails = get_emails(contact_id)
-        lead = score_lead(person, notes, emails)
-        borough_hint = detect_borough(person)
-
-        news_items = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
-        market = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
-
-        tone_txt, action, draft, _raw = gpt_analyze(
-            person, notes, emails, lead,
-            tone_mode="Recommended",
-            market_bullets=market.get("bullets"),
-            news_items=news_items,
-            borough_hint=borough_hint
-        )
-
-        insight = compute_insights_score(person, lead, get_revaluate_score(person), contact_id)
-        update_fub_insights_score(contact_id, insight)
-
-        log_analysis(
-            contact_id,
-            person.get("name"),
-            person.get("stage"),
-            person.get("tags"),
-            lead,
-            "WARM" if lead >= 5 else "COOL",
-            tone_txt,
-            "Recommended",
-            action,
-            draft,
-            insight,
-            get_revaluate_score(person),
-        )
-
-        # refresh "last" after logging
-        last = fetch_last_analysis(contact_id)
-
-    # 3) Render the widget with news/market (as before)
+    # Resolve contact id from param or FUB context blob
+    cid = _resolve_contact_id(request, contact_id)
     news = fetch_news(max_items=4, nyc_only=True)
     market = fetch_market_snapshot(area="NYC")
 
-    if not last:
-        # still nothing? (e.g., FUB API error) -> show empty state
+    if not cid:
+        # No id found: render a friendly empty state (no 422)
         return templates.TemplateResponse(
             "widget.html",
             {
@@ -242,9 +222,69 @@ def widget(
             },
         )
 
-    spark = fetch_latest_for_contact(contact_id, limit=5)
+    last = fetch_last_analysis(cid)
+
+    # Auto-run first analysis if requested and none exists yet
+    if not last and auto:
+        person = fub_get(f"/people/{cid}")
+        person = person.get("person", person) if isinstance(person, dict) else person
+        notes = get_notes(cid)
+        emails = get_emails(cid)
+        lead = score_lead(person, notes, emails)
+        borough_hint = detect_borough(person)
+
+        news_items = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
+        market_full = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
+
+        tone_txt, action, draft, _raw = gpt_analyze(
+            person,
+            notes,
+            emails,
+            lead,
+            tone_mode="Recommended",
+            market_bullets=market_full.get("bullets"),
+            news_items=news_items,
+            borough_hint=borough_hint,
+        )
+
+        insight = compute_insights_score(person, lead, get_revaluate_score(person), cid)
+        update_fub_insights_score(cid, insight)
+
+        log_analysis(
+            cid,
+            person.get("name"),
+            person.get("stage"),
+            person.get("tags"),
+            lead,
+            "WARM" if lead >= 5 else "COOL",
+            tone_txt,
+            "Recommended",
+            action,
+            draft,
+            insight,
+            get_revaluate_score(person),
+        )
+
+        last = fetch_last_analysis(cid)
+
+    if not last:
+        # Still nothing (e.g., FUB API problem): show empty state
+        return templates.TemplateResponse(
+            "widget.html",
+            {
+                "request": request,
+                "data": None,
+                "spark": [],
+                "news": news,
+                "market": market,
+                "include_market": include_market,
+                "include_news": include_news,
+            },
+        )
+
+    spark = fetch_latest_for_contact(cid, limit=5)
     data = {
-        "contact_id": contact_id,
+        "contact_id": cid,
         "name": last[0],
         "stage": last[1],
         "tags": last[2],
@@ -272,12 +312,9 @@ def widget(
         },
     )
 
-
-
 @app.get("/sandbox", dependencies=[Depends(require_auth)])
 def sandbox(request: Request):
     return templates.TemplateResponse("sandbox.html", {"request": request})
-
 
 # -----------------------------------------------------------------------------
 # APIs used by the UI
@@ -290,11 +327,9 @@ def api_get_news(q: str = Query("", description="Optional keyword"), max_items: 
         items = [i for i in items if ql in (i.get("title", "").lower() + " " + i.get("summary", "").lower())]
     return JSONResponse({"items": items})
 
-
 @app.get("/api/get_market_data")
 def api_market(area: str = "NYC"):
     return JSONResponse(fetch_market_snapshot(area=area))
-
 
 @app.post("/api/regen_draft")
 async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_news: int = 1, include_market: int = 1):
@@ -323,7 +358,7 @@ async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_ne
         borough_hint=borough_hint,
     )
 
-    # Compute and write-back Insights.ai Score to FUB custom field
+    # Compute and write back Insights.ai Score to FUB custom field
     insight = compute_insights_score(person, lead, get_revaluate_score(person), contact_id)
     update_fub_insights_score(contact_id, insight)
 
@@ -347,11 +382,9 @@ async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_ne
         {"tone": tone_txt, "tone_mode": tone_mode, "next_action": action, "draft": draft, "insights_score": insight}
     )
 
-
 @app.post("/api/refine_draft")
 async def api_refine_draft(contact_id: int, current_draft: str, tone: str = "Recommended"):
     import openai
-
     tone_mode = tone if tone in TONE_PROFILES else "Recommended"
     prompt = (
         "Refine and slightly tighten the following outreach draft without changing the tone or meaning. "
