@@ -27,10 +27,11 @@
 <body>
   <div class="wrap">
     <div class="panel">
-      {% if not data %}
-        <h2>Insights.ai</h2>
-        <div class="small">No recent analysis found for this contact yet.</div>
-      {% else %}
+{% if not data %}
+  <h2>Insights.ai</h2>
+  <div class="small">No recent analysis found for this contact yet.</div>
+  <a class="btn" style="margin-top:8px" href="#" onclick="regen();return false;">Analyze this contact</a>
+{% else %}
         <div class="row">
           <div><h2>Insights.ai Score</h2><div class="score">{{ data.insights_score or '—' }}/100</div></div>
           <div class="chip">{{ data.tone or '—' }}</div>
