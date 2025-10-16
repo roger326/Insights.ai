@@ -38,24 +38,29 @@ from market_news import fetch_news, fetch_market_snapshot
 # App bootstrap
 # -----------------------------------------------------------------------------
 load_dotenv()
-app = FastAPI(title="insights.ai – Command Hub (v7.1)")
+app = FastAPI(title="insights.ai – Command Hub (v7.2)")
 
-# Allow Follow Up Boss to embed in an iframe
+# CORS: not strictly needed for iframes, but harmless for XHRs from the widget
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://app.followupboss.com", "https://*.followupboss.com"],
-    allow_credentials=True,
+    allow_origins=["*"],        # generous; we do not send credentials cross-origin
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Security headers so FUB can embed us
 @app.middleware("http")
-async def allow_iframe_from_fub(request, call_next):
+async def security_headers(request: Request, call_next):
     resp = await call_next(request)
-    # Permit embedding by FUB (legacy + CSP)
-    resp.headers["X-Frame-Options"] = "ALLOWALL"
+    # Remove any X-Frame-Options that could block embedding
+    # (Some browsers treat unknown values as SAMEORIGIN.)
+    for k in list(resp.headers.keys()):
+        if k.lower() == "x-frame-options":
+            resp.headers.pop(k, None)
+    # Allow FUB (and subdomains) to iframe this app
     resp.headers["Content-Security-Policy"] = (
-        "frame-ancestors 'self' https://app.followupboss.com https://*.followupboss.com;"
+        "frame-ancestors 'self' https://app.followupboss.com https://*.followupboss.com https://*.followupboss.net;"
     )
     return resp
 
@@ -71,7 +76,14 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "Bernese2025!")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60 * 60 * 24)
+# Session cookie works inside FUB iframe: SameSite=None; Secure
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    max_age=60 * 60 * 24,
+    same_site="none",
+    https_only=True,
+)
 
 # OpenAI client (new SDK)
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -99,23 +111,18 @@ def require_auth(request: Request):
 # Helpers: resolve FUB contact id, extract Revaluate Score, generate draft
 # -----------------------------------------------------------------------------
 def _resolve_contact_id(request: Request, contact_id):
-    """
-    Accept an int-like contact_id or extract it from Follow Up Boss 'context' param.
-    """
     # If integer-like, use it
     try:
         if contact_id is not None and str(contact_id).isdigit():
             return int(contact_id)
     except Exception:
         pass
-
     # Fallback: parse FUB context
     ctx = request.query_params.get("context")
     if not ctx:
         return None
     try:
-        # Base64-url decode with padding and parse JSON
-        padded = ctx + "=" * (-len(ctx) % 4)
+        padded = ctx + "=" * (-len(ctx) % 4)  # base64url padding
         data = json.loads(urlsafe_b64decode(padded.encode()).decode())
         pid = data.get("person", {}).get("id")
         if pid:
@@ -125,28 +132,18 @@ def _resolve_contact_id(request: Request, contact_id):
     return None
 
 def _extract_revaluate(person: dict) -> float | None:
-    """
-    Robustly extract 'Revaluate Score' regardless of FUB custom field shape.
-    Tries these shapes:
-      1) person['custom'] -> dict with variants of the key
-      2) person['customFields'] -> list of {name,label,value}
-      3) person['properties'] or ['custom']['fields'] (rare legacy)
-    Returns float or None.
-    """
     if not person:
         return None
-
-    # 1) 'custom' dict
+    # 1) person['custom'] (dict or dict with 'fields' list)
     custom = person.get("custom")
     if isinstance(custom, dict):
-        for k in custom.keys():
+        for k in list(custom.keys()):
             kl = str(k).strip().lower()
             if "revaluate" in kl and "score" in kl:
                 try:
                     return float(custom[k])
                 except Exception:
                     pass
-        # some accounts nest: {'fields': [{'name': 'Revaluate Score', 'value': '40'}]}
         fields = custom.get("fields")
         if isinstance(fields, list):
             for f in fields:
@@ -156,25 +153,19 @@ def _extract_revaluate(person: dict) -> float | None:
                         return float(f.get("value"))
                     except Exception:
                         pass
-
-    # 2) 'customFields' array
+    # 2) person['customFields'] (list of maps)
     cf = person.get("customFields")
     if isinstance(cf, list):
         for f in cf:
-            # fields often have one of: name / label / field / fieldName
-            cand = (
-                f.get("name") or f.get("label") or f.get("fieldName") or f.get("field")
-            )
-            val = f.get("value")
+            cand = f.get("name") or f.get("label") or f.get("fieldName") or f.get("field")
             if cand and isinstance(cand, str):
                 kl = cand.strip().lower()
                 if "revaluate" in kl and "score" in kl:
                     try:
-                        return float(val)
+                        return float(f.get("value"))
                     except Exception:
                         pass
-
-    # 3) 'properties' map (rare)
+    # 3) rare 'properties'
     props = person.get("properties")
     if isinstance(props, dict):
         for k in props.keys():
@@ -184,7 +175,6 @@ def _extract_revaluate(person: dict) -> float | None:
                     return float(props[k])
                 except Exception:
                     pass
-
     return None
 
 def _generate_draft(person, notes, emails, lead, tone_mode, market_bullets=None, news_items=None, borough_hint=None):
@@ -196,11 +186,8 @@ def _generate_draft(person, notes, emails, lead, tone_mode, market_bullets=None,
         texts.extend([e.get("body", ""), e.get("subject", "")])
     combined = "\n".join([t for t in texts if t])[-3000:] or "(No recent text found.)"
     mb = "\n".join(f"- {b}" for b in (market_bullets or []))
-    ni = "\n".join(
-        f"- {n.get('title')} — {n.get('summary','')[:160]}..." for n in (news_items or [])
-    )
+    ni = "\n".join(f"- {n.get('title')} — {n.get('summary','')[:160]}..." for n in (news_items or []))
     b_focus = f"The client’s market context is {borough_hint.title()}." if borough_hint else ""
-
     prompt = f"""
 You are Roger's "Insights.ai" assistant. Draft a concise (≤ 90 words), human, NYC-savvy outreach.
 
@@ -224,7 +211,6 @@ Task:
 2) Keep it confident, helpful, and specific (no clichés).
 3) End with a soft next step.
 """.strip()
-
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -259,9 +245,7 @@ def login_submit(request: Request, password: str = Form(...)):
     if password == DASHBOARD_PASSWORD:
         request.session["authed"] = True
         return RedirectResponse(url="/", status_code=302)
-    return templates.TemplateResponse(
-        "login.html", {"request": request, "error": "Invalid password"}
-    )
+    return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid password"})
 
 @app.get("/", dependencies=[Depends(require_auth)])
 def index(request: Request):
@@ -285,9 +269,7 @@ def analytics(request: Request):
     valid = [r for r in rows if r[6] is not None]
     avg = round(sum([r[6] for r in valid]) / max(1, len(valid)), 2) if valid else 0
     metrics = {"count": len(rows), "avg_score": avg, "cats": cats, "tones": tones}
-    return templates.TemplateResponse(
-        "analytics.html", {"request": request, "rows": rows, "metrics": metrics}
-    )
+    return templates.TemplateResponse("analytics.html", {"request": request, "rows": rows, "metrics": metrics})
 
 @app.get("/export-csv", dependencies=[Depends(require_auth)])
 def export_csv():
@@ -303,23 +285,11 @@ def export_csv():
     )
     data = c.fetchall()
     conn.close()
-
     output = io.StringIO()
     import csv as _csv
     w = _csv.writer(output)
     w.writerow(
-        [
-            "contact_name",
-            "lead_score",
-            "category",
-            "tone",
-            "tone_mode",
-            "next_action",
-            "draft",
-            "insights_ai_score",
-            "revaluate_score",
-            "created_at",
-        ]
+        ["contact_name","lead_score","category","tone","tone_mode","next_action","draft","insights_ai_score","revaluate_score","created_at"]
     )
     for row in data:
         w.writerow(row)
@@ -341,29 +311,19 @@ def widget(
     include_news: int = 1,
     auto: int = 0,
 ):
-    # Resolve contact id from param or FUB context blob
     cid = _resolve_contact_id(request, contact_id)
     news = fetch_news(max_items=4, nyc_only=True)
     market = fetch_market_snapshot(area="NYC")
 
     if not cid:
-        # No id found: render a friendly empty state (no 422)
         return templates.TemplateResponse(
             "widget.html",
-            {
-                "request": request,
-                "data": None,
-                "spark": [],
-                "news": news,
-                "market": market,
-                "include_market": include_market,
-                "include_news": include_news,
-            },
+            {"request": request, "data": None, "spark": [], "news": news, "market": market,
+             "include_market": include_market, "include_news": include_news},
         )
 
     last = fetch_last_analysis(cid)
 
-    # Auto-run first analysis if requested and none exists yet
     if not last and auto:
         person = fub_get(f"/people/{cid}")
         person = person.get("person", person) if isinstance(person, dict) else person
@@ -373,59 +333,33 @@ def widget(
         borough_hint = detect_borough(person)
         news_items = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
         market_full = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
-        # NEW: robust Revaluate extraction
         reval = _extract_revaluate(person)
-
         tone_txt, action, draft = _generate_draft(
-            person, notes, emails, lead,
-            tone_mode="Recommended",
-            market_bullets=market_full.get("bullets"),
-            news_items=news_items,
-            borough_hint=borough_hint,
+            person, notes, emails, lead, tone_mode="Recommended",
+            market_bullets=market_full.get("bullets"), news_items=news_items, borough_hint=borough_hint
         )
-
         insight = compute_insights_score(person, lead, reval, cid)
         update_fub_insights_score(cid, insight)
-
         log_analysis(
-            cid,
-            person.get("name"),
-            person.get("stage"),
-            person.get("tags"),
-            lead,
-            "WARM" if lead >= 5 else "COOL",
-            tone_txt,
-            "Recommended",
-            action,
-            draft,
-            insight,
-            reval,
+            cid, person.get("name"), person.get("stage"), person.get("tags"),
+            lead, "WARM" if lead>=5 else "COOL", tone_txt, "Recommended",
+            action, draft, insight, reval
         )
-
         last = fetch_last_analysis(cid)
 
     if not last:
-        # Still nothing (e.g., FUB API problem): show empty state
         return templates.TemplateResponse(
             "widget.html",
-            {
-                "request": request,
-                "data": None,
-                "spark": [],
-                "news": news,
-                "market": market,
-                "include_market": include_market,
-                "include_news": include_news,
-            },
+            {"request": request, "data": None, "spark": [], "news": news, "market": market,
+             "include_market": include_market, "include_news": include_news},
         )
 
-    # If the stored reval is None, try to fetch a current value live for display
     display_reval = last[10]
     if display_reval is None:
         try:
-            person_now = fub_get(f"/people/{cid}")
-            person_now = person_now.get("person", person_now) if isinstance(person_now, dict) else person_now
-            display_reval = _extract_revaluate(person_now)
+            p_now = fub_get(f"/people/{cid}")
+            p_now = p_now.get("person", p_now) if isinstance(p_now, dict) else p_now
+            display_reval = _extract_revaluate(p_now)
         except Exception:
             pass
 
@@ -445,18 +379,10 @@ def widget(
         "reval": display_reval,
         "created_at": last[11],
     }
-
     return templates.TemplateResponse(
         "widget.html",
-        {
-            "request": request,
-            "data": data,
-            "spark": spark,
-            "news": news,
-            "market": market,
-            "include_market": include_market,
-            "include_news": include_news,
-        },
+        {"request": request, "data": data, "spark": spark, "news": news, "market": market,
+         "include_market": include_market, "include_news": include_news},
     )
 
 @app.get("/sandbox", dependencies=[Depends(require_auth)])
@@ -480,56 +406,28 @@ def api_market(area: str = "NYC"):
 
 @app.post("/api/regen_draft")
 async def api_regen_draft(contact_id: int, tone: str = "Recommended", include_news: int = 1, include_market: int = 1):
-    # Fetch FUB data
     person = fub_get(f"/people/{contact_id}")
     person = person.get("person", person) if isinstance(person, dict) else person
     notes = get_notes(contact_id)
     emails = get_emails(contact_id)
-
-    # Scoring + context
     lead = score_lead(person, notes, emails)
     borough_hint = detect_borough(person)
     news = fetch_news(max_items=6, nyc_only=True, borough_hint=borough_hint) if include_news else []
     market = fetch_market_snapshot(area="NYC") if include_market else {"bullets": []}
-    # NEW: robust Revaluate extraction
     reval = _extract_revaluate(person)
-
-    # Generate draft (new SDK)
     tone_mode = tone if tone in TONE_PROFILES else "Recommended"
     tone_txt, action, draft = _generate_draft(
-        person,
-        notes,
-        emails,
-        lead,
-        tone_mode=tone_mode,
-        market_bullets=market.get("bullets"),
-        news_items=news,
-        borough_hint=borough_hint,
+        person, notes, emails, lead, tone_mode=tone_mode,
+        market_bullets=market.get("bullets"), news_items=news, borough_hint=borough_hint
     )
-
-    # Compute and write back Insights.ai Score to FUB custom field
     insight = compute_insights_score(person, lead, reval, contact_id)
     update_fub_insights_score(contact_id, insight)
-
-    # Log locally for analytics (store reval too)
     log_analysis(
-        contact_id,
-        person.get("name"),
-        person.get("stage"),
-        person.get("tags"),
-        lead,
-        "WARM" if lead >= 5 else "COOL",
-        tone_txt,
-        tone_mode,
-        action,
-        draft,
-        insight,
-        reval,
+        contact_id, person.get("name"), person.get("stage"), person.get("tags"),
+        lead, "WARM" if lead>=5 else "COOL", tone_txt, tone_mode, action, draft, insight, reval
     )
-
-    return JSONResponse(
-        {"tone": tone_txt, "tone_mode": tone_mode, "next_action": action, "draft": draft, "insights_score": insight, "revaluate_score": reval}
-    )
+    return JSONResponse({"tone": tone_txt, "tone_mode": tone_mode, "next_action": action,
+                         "draft": draft, "insights_score": insight, "revaluate_score": reval})
 
 @app.post("/api/refine_draft")
 async def api_refine_draft(contact_id: int, current_draft: str, tone: str = "Recommended"):
@@ -539,7 +437,7 @@ async def api_refine_draft(contact_id: int, current_draft: str, tone: str = "Rec
         f"Keep <= 90 words. Tone style: {TONE_PROFILES.get(tone_mode, '')}\n\n---\n{current_draft}\n---"
     )
     try:
-        resp = client.chat.completions.create(
+        resp = OpenAI(api_key=os.getenv("OPENAI_API_KEY")).chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
